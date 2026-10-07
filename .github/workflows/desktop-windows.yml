@@ -113,26 +113,9 @@ jobs:
           echo "--- installer/portable ---"
           ls -la release/*.exe
 
-      - name: Self-test the packaged app
-        if: ${{ inputs.smoke_test || github.event_name == 'push' }}
-        id: smoke
-        shell: bash
-        env:
-          OMP_DESKTOP_VERIFY: "1"
-          OMP_DESKTOP_VERIFY_OUT: ${{ github.workspace }}\verify-output
-          OMP_DESKTOP_VERIFY_TIMEOUT: "120000"
-          OMP_DESKTOP_VERBOSE: "1"
-        run: |
-          set -o pipefail
-          APP="release/win-unpacked/Oh My Pi Desktop.exe"
-          test -f "$APP" || { echo "packaged app missing at $APP"; ls -R release/win-unpacked | head -40; exit 1; }
-          "$APP" > smoke.log 2>&1 || true
-          echo "=== smoke log ==="
-          tail -60 smoke.log || true
-          echo "=== report ==="
-          cat verify-output/report.json || { echo "no verify report was written"; exit 1; }
-          node -e "const r=require('./verify-output/report.json'); console.log('ok:', r.ok, 'failures:', JSON.stringify(r.failures)); if(!r.ok) process.exit(1)"
-
+      # Artifacts are uploaded before the smoke test on purpose: the exe and the
+      # installer exist at this point, and a headless runner is the least
+      # reliable place to boot a GUI app.
       - name: Upload the installer and portable exe
         if: always()
         uses: actions/upload-artifact@v4
@@ -142,7 +125,6 @@ jobs:
             release/*.exe
             release/*.blockmap
             release/latest.yml
-            verify-output/**
           if-no-files-found: error
           retention-days: 30
 
@@ -152,6 +134,49 @@ jobs:
         with:
           name: omp-desktop-windows-unpacked-${{ github.run_number }}
           path: release/win-unpacked/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Boot the packaged app on this runner and let it self-test: resolve the
+      # bundled omp.exe, handshake over RPC, classify the entry points, run one
+      # one-shot request, probe the DOM. Software rendering, bounded wait, and
+      # the report decides pass or fail.
+      - name: Self-test the packaged app
+        if: ${{ inputs.smoke_test || github.event_name == 'push' }}
+        id: smoke
+        timeout-minutes: 6
+        shell: bash
+        env:
+          OMP_DESKTOP_VERIFY: "1"
+          OMP_DESKTOP_VERIFY_OUT: ${{ github.workspace }}\verify-output
+          OMP_DESKTOP_VERIFY_TIMEOUT: "120000"
+          OMP_DESKTOP_VERBOSE: "1"
+        run: |
+          set -o pipefail
+          APP="release/win-unpacked/Oh My Pi Desktop.exe"
+          test -f "$APP" || { echo "packaged app missing at $APP"; ls release/win-unpacked | head -40; exit 1; }
+
+          "$APP" --disable-gpu --no-sandbox > smoke.log 2>&1 &
+          APP_PID=$!
+          for _ in $(seq 1 36); do
+            [ -f verify-output/report.json ] && break
+            sleep 5
+          done
+          kill "$APP_PID" 2>/dev/null || true
+          wait "$APP_PID" 2>/dev/null || true
+
+          echo "=== smoke log ==="
+          tail -40 smoke.log || true
+          echo "=== report ==="
+          cat verify-output/report.json || { echo "the packaged app wrote no verify report"; exit 1; }
+          node -e "const r=require('./verify-output/report.json'); console.log('ok:', r.ok, 'packaged:', r.packaged, 'failures:', JSON.stringify(r.failures)); if(!r.ok) process.exit(1)"
+
+      - name: Upload the self-test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: omp-desktop-windows-selftest-${{ github.run_number }}
+          path: verify-output/**
           if-no-files-found: warn
           retention-days: 14
 
