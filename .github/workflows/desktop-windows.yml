@@ -13,7 +13,21 @@ name: Desktop · Windows artifacts
 # from github.com/can1357/oh-my-pi/releases), verified against the release's
 # SHA256SUMS.txt before packaging. Set `omp_version` to pin a tag.
 
+# Two ways in: dispatch it by hand (Actions tab or `gh workflow run`), or let a
+# push to main that touches the desktop sources build the artifacts for you.
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "desktop-shell/**"
+      - "resources/**"
+      - "scripts/**"
+      - "electron-builder.yml"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/desktop-windows.yml"
   workflow_dispatch:
     inputs:
       omp_version:
@@ -21,6 +35,8 @@ on:
         required: false
         default: "latest"
         type: string
+      # Pushes reuse the same defaults; `inputs.*` is empty for them, hence the
+      # `|| 'latest'` fallbacks below.
       release:
         description: "Publish the artifacts as a GitHub Release in this repository"
         required: false
@@ -48,7 +64,7 @@ jobs:
     env:
       # electron-builder must never publish on its own; releases are opt-in below.
       CSC_IDENTITY_AUTO_DISCOVERY: "false"
-      OMP_RUNTIME_VERSION: ${{ inputs.omp_version }}
+      OMP_RUNTIME_VERSION: ${{ inputs.omp_version || 'latest' }}
 
     steps:
       - name: Check out the repository
@@ -98,7 +114,7 @@ jobs:
           ls -la release/*.exe
 
       - name: Self-test the packaged app
-        if: ${{ inputs.smoke_test }}
+        if: ${{ inputs.smoke_test || github.event_name == 'push' }}
         id: smoke
         shell: bash
         env:
@@ -149,6 +165,6 @@ jobs:
           tag="desktop-v$(node -p "require('./package.json').version")-build.${{ github.run_number }}"
           gh release create "$tag" \
             --title "Oh My Pi Desktop $tag" \
-            --notes "Windows build from workflow dispatch (run ${{ github.run_number }}). Bundled omp runtime: ${{ inputs.omp_version }}. Installer and portable executable attached." \
+            --notes "Windows build from ${{ github.event_name }} (run ${{ github.run_number }}). Bundled omp runtime: ${{ inputs.omp_version || 'latest' }}. Installer and portable executable attached." \
             release/*.exe
           echo "released $tag"
