@@ -51,9 +51,11 @@ on:
 permissions:
   contents: write
 
+# One packaging run per branch. A newer push supersedes the older run instead of
+# queueing behind it, so a wedged GUI step can never block the next build.
 concurrency:
   group: desktop-windows-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   windows:
@@ -156,19 +158,24 @@ jobs:
           APP="release/win-unpacked/Oh My Pi Desktop.exe"
           test -f "$APP" || { echo "packaged app missing at $APP"; ls release/win-unpacked | head -40; exit 1; }
 
+          # The app is a GUI process: launch it detached, poll for the report it
+          # writes, then tear down the whole process tree. Never `wait` on it and
+          # never run it in the foreground, or this step hangs until the runner
+          # kills it.
+          rm -f verify-output/report.json
           "$APP" --disable-gpu --no-sandbox > smoke.log 2>&1 &
           APP_PID=$!
           for _ in $(seq 1 36); do
             [ -f verify-output/report.json ] && break
             sleep 5
           done
-          kill "$APP_PID" 2>/dev/null || true
-          wait "$APP_PID" 2>/dev/null || true
+          cmd //c "taskkill /F /T /PID $APP_PID" >/dev/null 2>&1 || kill -9 "$APP_PID" 2>/dev/null || true
+          sleep 2
 
           echo "=== smoke log ==="
           tail -40 smoke.log || true
           echo "=== report ==="
-          cat verify-output/report.json || { echo "the packaged app wrote no verify report"; exit 1; }
+          cat verify-output/report.json || { echo "the packaged app wrote no verify report within the wait window"; exit 1; }
           node -e "const r=require('./verify-output/report.json'); console.log('ok:', r.ok, 'packaged:', r.packaged, 'failures:', JSON.stringify(r.failures)); if(!r.ok) process.exit(1)"
 
       - name: Upload the self-test report
