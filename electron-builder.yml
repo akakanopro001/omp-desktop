@@ -1,0 +1,102 @@
+# electron-builder — Oh My Pi Desktop
+#
+# Windows is the shipping target the desktop shell is built around (see
+# docs: desktop-shell/main.cjs resolves `omp.exe` first on win32). Two artifacts
+# come out of one run:
+#
+#   • NSIS installer      Oh-My-Pi-Desktop-Setup-<version>-x64.exe
+#   • Portable executable Oh-My-Pi-Desktop-Portable-<version>-x64.exe
+#
+# The same config also produces AppImage/deb and dmg/zip so the shell can be
+# verified natively while developing.
+#
+# The bundled omp runtime travels in `resources/omp-runtime`; CI drops the real
+# release binary for the target platform there before packaging
+# (`omp-windows-x64.exe` from github.com/can1357/oh-my-pi/releases) and the
+# shell picks it up ahead of any installed runtime.
+
+appId: sh.omp.desktop
+productName: Oh My Pi Desktop
+copyright: Copyright © Stencil Labs, Inc. — desktop shell + bundled omp runtime
+
+directories:
+  output: release
+  buildResources: build
+
+# The renderer is pre-bundled by Vite into dist/ and the main process is plain
+# CommonJS, so no runtime node_modules need to ship. Everything else is either
+# in dist/ or in extraResources below.
+files:
+  - dist/**/*
+  - desktop-shell/**/*
+  - package.json
+  - "!node_modules"
+  - "!**/*.map"
+  - "!**/*.ts"
+  - "!**/tsconfig*.json"
+
+extraResources:
+  - from: resources/omp-runtime
+    to: omp-runtime
+    filter:
+      - "**/*"
+      - "!**/*.map"
+
+asar: true
+# `normal` keeps the Windows build inside a few minutes even with the ~236 MB
+# upstream omp runtime in extraResources; the payload is already compressed.
+compression: normal
+buildDependenciesFromSource: false
+npmRebuild: false
+
+win:
+  icon: build/icon.ico
+  # x64 is what the upstream release ships for Windows today; arm64 is one
+  # line away and already has a published binary upstream.
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+  requestedExecutionLevel: asInvoker
+  verifyUpdateCodeSignature: false
+  publish: null
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: true
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Oh My Pi Desktop
+  uninstallDisplayName: Oh My Pi Desktop ${version}
+  deleteAppDataOnUninstall: false
+  artifactName: Oh-My-Pi-Desktop-Setup-${version}-${arch}.${ext}
+
+portable:
+  artifactName: Oh-My-Pi-Desktop-Portable-${version}-${arch}.${ext}
+  requestExecutionLevel: user
+  unpackDirName: omp-desktop
+
+linux:
+  icon: build/icon.png
+  category: Development
+  synopsis: Native desktop shell for the oh-my-pi coding agent
+  target:
+    - AppImage
+    - deb
+  artifactName: Oh-My-Pi-Desktop-${version}-${arch}.${ext}
+
+appImage:
+  artifactName: Oh-My-Pi-Desktop-${version}-${arch}.${ext}
+
+mac:
+  icon: build/icon.png
+  category: public.app-category.developer-tools
+  target:
+    - dmg
+    - zip
+  artifactName: Oh-My-Pi-Desktop-${version}-${arch}.${ext}

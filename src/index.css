@@ -1,0 +1,156 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 210 20% 98%;
+    --foreground: 220 18% 12%;
+    --card: 0 0% 100%;
+    --card-foreground: 220 18% 12%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 220 18% 12%;
+    --primary: 22 92% 48%;
+    --primary-foreground: 24 100% 98%;
+    --secondary: 220 14% 94%;
+    --secondary-foreground: 220 18% 18%;
+    --muted: 220 14% 95%;
+    --muted-foreground: 220 10% 42%;
+    --accent: 190 80% 38%;
+    --accent-foreground: 190 100% 97%;
+    --destructive: 0 72% 46%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 14% 88%;
+    --input: 220 14% 88%;
+    --ring: 22 92% 48%;
+    --radius: 0.5rem;
+    --chrome: 220 16% 96%;
+    --panel: 0 0% 100%;
+    --rail: 220 18% 94%;
+    --hairline: 220 14% 86%;
+    --ember: 22 92% 48%;
+    --flux: 190 80% 38%;
+    --ok: 152 60% 34%;
+    --warn: 38 92% 44%;
+  }
+
+  .dark {
+    --background: 220 18% 5%;
+    --foreground: 210 20% 92%;
+    --card: 220 16% 7%;
+    --card-foreground: 210 20% 92%;
+    --popover: 220 18% 8%;
+    --popover-foreground: 210 20% 92%;
+    --primary: 22 96% 58%;
+    --primary-foreground: 20 30% 8%;
+    --secondary: 220 12% 13%;
+    --secondary-foreground: 210 18% 88%;
+    --muted: 220 12% 12%;
+    --muted-foreground: 218 10% 58%;
+    --accent: 186 74% 48%;
+    --accent-foreground: 190 40% 8%;
+    --destructive: 0 68% 52%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 12% 16%;
+    --input: 220 12% 18%;
+    --ring: 22 96% 58%;
+    --chrome: 220 18% 6%;
+    --panel: 220 16% 7.5%;
+    --rail: 220 20% 5.5%;
+    --hairline: 220 12% 15%;
+    --ember: 22 96% 58%;
+    --flux: 186 74% 48%;
+    --ok: 152 52% 46%;
+    --warn: 38 92% 55%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "cv11", "ss01";
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: hsl(var(--ember) / 0.28);
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--hairline));
+    border-radius: 999px;
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.5);
+    background-clip: content-box;
+  }
+
+  input,
+  textarea,
+  button {
+    font: inherit;
+  }
+}
+
+@layer components {
+  .mono-label {
+    @apply font-mono text-2xs uppercase tracking-[0.14em] text-muted-foreground;
+  }
+
+  .hairline-t {
+    @apply border-t border-hairline;
+  }
+
+  .hairline-b {
+    @apply border-b border-hairline;
+  }
+
+  .surface-panel {
+    background: hsl(var(--panel));
+  }
+
+  .surface-chrome {
+    background: hsl(var(--chrome));
+  }
+
+  .surface-rail {
+    background: hsl(var(--rail));
+  }
+
+  .grid-noise {
+    background-image:
+      linear-gradient(hsl(var(--hairline) / 0.55) 1px, transparent 1px),
+      linear-gradient(90deg, hsl(var(--hairline) / 0.55) 1px, transparent 1px);
+    background-size: 44px 44px;
+  }
+
+  .radial-ember {
+    background:
+      radial-gradient(900px 480px at 12% -10%, hsl(var(--ember) / 0.16), transparent 65%),
+      radial-gradient(700px 420px at 92% 8%, hsl(var(--flux) / 0.12), transparent 60%);
+  }
+
+  .focus-ring {
+    @apply outline-none ring-offset-0 focus-visible:ring-1 focus-visible:ring-ring/70;
+  }
+}

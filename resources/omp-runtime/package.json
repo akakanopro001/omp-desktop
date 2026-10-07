@@ -1,0 +1,10 @@
+{
+  "name": "omp-runtime",
+  "private": true,
+  "version": "1.7.2",
+  "description": "Bundled omp agent payload. Replaced at build time by the real @oh-my-pi/pi-coding-agent binary; the stub here lets the shell's resolver, gateway spawn and JSON-RPC handshake be verified without a network install.",
+  "type": "commonjs",
+  "bin": {
+    "omp": "./bin/omp"
+  }
+}

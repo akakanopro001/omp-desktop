@@ -1,0 +1,463 @@
+#!/usr/bin/env node
+/**
+ * Bundled omp runtime payload.
+ *
+ * A packaged build replaces this file with the real release binary for the
+ * target platform (`omp-windows-x64.exe`, `omp-linux-x64`, `omp-darwin-arm64`, …)
+ * downloaded from https://github.com/can1357/oh-my-pi/releases. When no release
+ * binary is present this stub stands in, so the shell's runtime resolver, its
+ * omp RPC transport, the one-shot entry point and the /status probe can all be
+ * verified end to end without a provider key or a model call.
+ *
+ * It implements the upstream surface, not an invention of its own:
+ *
+ *   omp --version                                  version probe
+ *   omp --help                                     entry-point discovery
+ *   omp -p "<prompt>" --mode text                  one-shot, non-interactive
+ *   omp -p --mode json                             one-shot, JSON event stream
+ *   omp --mode rpc [--no-ui]                       JSONL commands/responses/events
+ *   omp --mode rpc --http N                        the same, plus an HTTP /status
+ *   omp --mode acp                                 prints the ACP handshake line
+ *
+ * Transport contract (docs/rpc.md upstream): stdout is one JSON object per line,
+ * a `ready` frame is written before any command is read, commands carry an
+ * optional `id` that responses echo, and closing stdin drains the session and
+ * exits 0.
+ *
+ * Env:
+ *   OMP_HOME       user-data home (the stub logs under $OMP_HOME/logs)
+ *   OMP_STUB_HTTP  port for the optional HTTP gateway (0 disables it)
+ */
+
+const readline = require("node:readline");
+const http = require("node:http");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const VERSION = "omp 18.7.0 (desktop payload stub)";
+const SERVER_NAME = "omp";
+const PROTOCOL_VERSIONS = [1, 2];
+const MAX_FRAME_BYTES = 1048576;
+const MAX_REASSEMBLED_FRAME_BYTES = 67108864;
+
+const argv = process.argv.slice(2);
+const has = (flag) => argv.includes(flag);
+const valueOf = (flag) => {
+  const index = argv.indexOf(flag);
+  if (index === -1) return undefined;
+  const value = argv[index + 1];
+  return value && !value.startsWith("-") ? value : undefined;
+};
+const OMP_HOME = process.env.OMP_HOME || path.join(process.env.HOME || process.cwd(), ".omp");
+
+function log(line) {
+  process.stderr.write(`omp-runtime ${line}\n`);
+  try {
+    const dir = path.join(OMP_HOME, "logs");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(path.join(dir, "omp-runtime.log"), `${new Date().toISOString()} ${line}\n`);
+  } catch {
+    /* logging must never break the runtime */
+  }
+}
+
+const HELP = `omp 18.7.0 — the coding agent with the IDE wired in
+
+Usage
+  omp [options] [prompt]                 start an interactive session
+  omp -p "<prompt>" [--mode text|json]   process prompts non-interactively and exit
+  omp --mode rpc [--no-ui]               line-delimited JSON over stdio
+  omp acp | omp --mode acp               Agent Client Protocol server over stdio
+
+Output modes (--mode)
+  text   rendered text (with --print)
+  json   newline-delimited JSON event stream
+  rpc    command/response/event transport over stdio
+  rpc-ui RPC with extension UI frames enabled
+  acp    Agent Client Protocol server
+
+Options
+  -p, --print         process prompts non-interactively and exit
+  --print-thoughts    include thinking blocks in printed output
+  --model <selector>  model for the default role
+  --no-ui             run extensions headless under rpc/rpc-ui
+  --http <port>       this payload's /status gateway (desktop convenience)
+  -v, --version       print the version
+  -h, --help          print this help
+
+Tools: read write edit ast_edit ast_grep grep glob bash eval lsp debug
+       security_scan task wait todo ask browser computer web_search github
+       generate_image tts checkpoint rewind retain recall reflect memory_edit
+       learn manage_skill
+Schemes: pr:// issue:// agent:// skill:// ssh:// conflict:// xd:// proc:// memory://
+         rule:// artifact:// attachment:// cfg:// history:// mcp:// omp:// vault://
+         security:// local://
+`;
+
+const TOOLS = [
+  "read",
+  "write",
+  "edit",
+  "ast_edit",
+  "ast_grep",
+  "grep",
+  "glob",
+  "bash",
+  "eval",
+  "lsp",
+  "debug",
+  "security_scan",
+  "task",
+  "wait",
+  "todo",
+  "ask",
+  "browser",
+  "computer",
+  "web_search",
+  "github",
+  "generate_image",
+  "tts",
+  "checkpoint",
+  "rewind",
+  "retain",
+  "recall",
+  "reflect",
+  "memory_edit",
+  "learn",
+  "manage_skill",
+];
+
+const COMMANDS = [
+  "review",
+  "annotate",
+  "advisor",
+  "collab",
+  "fresh",
+  "compact",
+  "clear",
+  "new",
+  "model",
+  "login",
+  "logout",
+  "memory",
+  "skills",
+  "tools",
+  "schemes",
+  "todo",
+  "jobs",
+  "usage",
+  "context",
+  "agents",
+  "hub",
+  "tree",
+  "git",
+  "mcp",
+  "plan",
+  "vibe",
+  "goal",
+  "fast",
+  "slow",
+  "thinking",
+  "vision",
+  "hotkeys",
+  "help",
+];
+
+const MODELS = [
+  { provider: "anthropic", modelId: "opus-4.6-1m", name: "Opus 4.6 (1M)", roles: ["default", "slow"] },
+  { provider: "anthropic", modelId: "sonnet-4.7", name: "Sonnet 4.7", roles: ["task"] },
+  { provider: "anthropic", modelId: "haiku-4.6", name: "Haiku 4.6", roles: ["commit", "smol"] },
+  { provider: "openai", modelId: "gpt-5.5", name: "GPT-5.5", roles: ["advisor"] },
+  { provider: "openai", modelId: "gpt-5.5-mini", name: "GPT-5.5 mini", roles: ["tiny"] },
+  { provider: "google", modelId: "gemini-3-pro", name: "Gemini 3 Pro", roles: ["plan", "vision"] },
+  { provider: "xai", modelId: "grok-4-fast", name: "Grok 4 Fast", roles: ["smol"] },
+];
+
+function send(frame) {
+  process.stdout.write(`${JSON.stringify(frame)}\n`);
+}
+
+function startHttpGateway(port) {
+  if (!port) return;
+  const server = http.createServer((request, response) => {
+    if (request.url === "/status" || request.url === "/health") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          server: SERVER_NAME,
+          version: VERSION,
+          transport: "rpc",
+          protocolVersion: 2,
+          auth: "none",
+          websocket: false,
+          rpc: true,
+          sessions: true,
+          fileBrowser: true,
+          lsp: true,
+          debug: true,
+          subagents: true,
+          memory: true,
+          tools: TOOLS.length,
+          commands: COMMANDS.length,
+        }),
+      );
+      return;
+    }
+    response.writeHead(404, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: "not found" }));
+  });
+  server.listen(port, "127.0.0.1", () => {
+    const address = server.address();
+    log(`http gateway listening on 127.0.0.1:${typeof address === "object" && address ? address.port : port}`);
+  });
+  server.on("error", (error) => log(`http gateway error: ${error.message}`));
+}
+
+/** One-shot and json modes share one body of work; only the framing differs. */
+function runPrint(prompt) {
+  const summary = {
+    prompt,
+    runtime: VERSION,
+    provider: null,
+    text:
+      `Bundled desktop payload — offline stub for ${SERVER_NAME} 18.7.0.\n` +
+      `  prompt      ${prompt}\n` +
+      `  transport   rpc protocol v1/v2, ready frame verified\n` +
+      `  tools       ${TOOLS.length} core tools · ${COMMANDS.length} slash commands · 9 model roles\n` +
+      `  schemes     19 internal URL schemes readable through read/grep/glob/write\n` +
+      `  note        a packaged build ships the real release binary; this payload\n` +
+      `              answers the transport so the shell can be verified without a key\n`,
+  };
+  if (valueOf("--mode") === "json") {
+    send({ type: "agent_start", at: Date.now() });
+    send({ type: "message_update", role: "assistant", delta: summary.text });
+    send({ type: "message_end", role: "assistant", text: summary.text });
+    send({ type: "agent_end", messages: 1, yielded: true });
+    send({ type: "session_settled" });
+    return;
+  }
+  process.stdout.write(summary.text);
+}
+
+if (has("--version") || has("-v")) {
+  process.stdout.write(`${VERSION}\n`);
+  process.exit(0);
+}
+
+if (has("--help") || has("-h")) {
+  process.stdout.write(HELP);
+  process.exit(0);
+}
+
+const mode = valueOf("--mode");
+
+if (has("--print") || has("-p")) {
+  const explicit = argv.filter((arg, index) => !arg.startsWith("-") && argv[index - 1] !== "--mode" && argv[index - 1] !== "--model");
+  const prompt = explicit.join(" ").trim() || "Explain what this runtime can do.";
+  log(`one-shot run (mode=${mode ?? "text"})`);
+  runPrint(prompt);
+  process.exit(0);
+}
+
+if (mode === "acp") {
+  // A real ACP host drives initialize → session/new → session/prompt. The stub
+  // emits the opening frame so the entry point can be discovered and probed.
+  send({ jsonrpc: "2.0", method: "acp/ready", params: { agentInfo: { name: SERVER_NAME, version: "18.7.0" }, protocolVersion: 1 } });
+  log("acp server listening on stdio");
+  readline.createInterface({ input: process.stdin }).on("close", () => process.exit(0));
+  return;
+}
+
+if (mode !== "rpc" && mode !== "rpc-ui") {
+  log(`unknown invocation: ${argv.join(" ") || "(none)"}; supported: --version, --help, -p, --mode text|json|rpc|rpc-ui|acp`);
+  process.exit(1);
+}
+
+const state = {
+  sessionId: `stub-${process.pid}`,
+  cwd: process.cwd(),
+  model: { provider: "anthropic", modelId: "opus-4.6-1m" },
+  thinkingLevel: "medium",
+  fastMode: false,
+  slowMode: false,
+  todos: [],
+  entries: [],
+  subscribers: "off",
+  promptCount: 0,
+};
+
+log(`rpc gateway started (stdio, mode=${mode}) home=${OMP_HOME} pid=${process.pid}`);
+startHttpGateway(Number(valueOf("--http") ?? process.env.OMP_STUB_HTTP ?? 0));
+
+// The ready frame comes first, before any command is read.
+send({
+  type: "ready",
+  protocolVersion: 1,
+  supportedProtocolVersions: PROTOCOL_VERSIONS,
+  maxFrameBytes: MAX_FRAME_BYTES,
+  maxReassembledFrameBytes: MAX_REASSEMBLED_FRAME_BYTES,
+  serverInfo: { name: SERVER_NAME, version: VERSION, mode: "bundled-payload" },
+});
+
+const rl = readline.createInterface({ input: process.stdin });
+let negotiated = 1;
+
+function reply(frame, data) {
+  send({ id: frame.id, type: "response", command: frame.type, success: true, data });
+}
+
+function fail(frame, error) {
+  send({ id: frame.id, type: "response", command: frame.type, success: false, error });
+}
+
+rl.on("line", (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  let frame;
+  try {
+    frame = JSON.parse(trimmed);
+  } catch {
+    send({ type: "response", command: "parse", success: false, error: "Malformed JSON command" });
+    return;
+  }
+
+  log(`rpc <- ${frame.type}${frame.id === undefined ? "" : ` (#${frame.id})`}`);
+
+  switch (frame.type) {
+    case "negotiate_protocol":
+      if (Number(frame.protocolVersion) === 2) {
+        negotiated = 2;
+        reply(frame, { protocolVersion: 2, maxFrameBytes: MAX_FRAME_BYTES, maxReassembledFrameBytes: MAX_REASSEMBLED_FRAME_BYTES });
+        log("protocol negotiated: v2");
+      } else {
+        fail(frame, `Unsupported protocol version: ${frame.protocolVersion}`);
+      }
+      break;
+
+    case "get_state":
+      reply(frame, {
+        sessionId: state.sessionId,
+        cwd: state.cwd,
+        model: state.model,
+        thinkingLevel: state.thinkingLevel,
+        fastMode: state.fastMode,
+        slowMode: state.slowMode,
+        todos: state.todos,
+        queue: { steering: [], followUp: [] },
+        protocolVersion: negotiated,
+        tools: TOOLS,
+        capabilities: { sessions: true, streaming: true, subagents: true, memory: true },
+      });
+      break;
+
+    case "get_available_models":
+      reply(frame, MODELS);
+      break;
+
+    case "get_available_commands":
+      reply(frame, COMMANDS.map((name) => ({ name, source: "builtin" })));
+      break;
+
+    case "get_available_thinking_levels":
+      reply(frame, ["off", "low", "medium", "high", "ultra"]);
+      break;
+
+    case "get_entries":
+      reply(frame, state.entries);
+      break;
+
+    case "get_tree":
+      reply(frame, { roots: [state.sessionId], branches: [] });
+      break;
+
+    case "get_subagents":
+      reply(frame, []);
+      break;
+
+    case "get_subagent_messages":
+      reply(frame, { messages: [], nextByte: 0 });
+      break;
+
+    case "set_subagent_subscription":
+      state.subscribers = frame.level ?? "off";
+      reply(frame, { level: state.subscribers });
+      break;
+
+    case "set_model":
+      state.model = { provider: frame.provider, modelId: frame.modelId };
+      reply(frame, state.model);
+      break;
+
+    case "cycle_model":
+      reply(frame, state.model);
+      break;
+
+    case "set_thinking_level":
+      state.thinkingLevel = frame.level;
+      reply(frame, { level: state.thinkingLevel });
+      break;
+
+    case "cycle_thinking_level":
+      reply(frame, { level: state.thinkingLevel });
+      break;
+
+    case "set_todos":
+      state.todos = Array.isArray(frame.phases) ? frame.phases : [];
+      reply(frame, { todos: state.todos });
+      break;
+
+    case "set_fast_mode":
+    case "set_slow_mode":
+      state[frame.type === "set_fast_mode" ? "fastMode" : "slowMode"] = Boolean(frame.enabled);
+      reply(frame, { enabled: Boolean(frame.enabled) });
+      break;
+
+    case "new_session":
+      state.sessionId = `stub-${process.pid}-${state.entries.length + 1}`;
+      state.entries = [];
+      reply(frame, { sessionId: state.sessionId });
+      break;
+
+    case "abort":
+      reply(frame, { aborted: true });
+      break;
+
+    case "prompt":
+    case "abort_and_prompt":
+    case "steer":
+    case "follow_up": {
+      const message = String(frame.message ?? "");
+      state.promptCount += 1;
+      const text =
+        `Bundled desktop payload — no provider is attached, so this reply is generated locally.\n` +
+        `Received: ${message}\n` +
+        `Session ${state.sessionId} · model ${state.model.provider}/${state.model.modelId} · ${TOOLS.length} tools · ${COMMANDS.length} commands.`;
+      reply(frame, { agentInvoked: true, sessionId: state.sessionId });
+      setTimeout(() => {
+        send({ type: "agent_start", sessionId: state.sessionId });
+        send({ type: "message_update", sessionId: state.sessionId, role: "assistant", delta: text });
+        send({ type: "message_end", sessionId: state.sessionId, role: "assistant", text });
+        send({ type: "agent_end", sessionId: state.sessionId, messages: 1, yielded: true });
+        send({ type: "prompt_result", id: frame.id, agentInvoked: true, status: "completed", sessionSettled: true });
+        send({ type: "session_settled", sessionId: state.sessionId });
+      }, 10);
+      break;
+    }
+
+    default:
+      fail(frame, `Unknown command: ${frame.type}`);
+      log(`rpc -> error: unknown command (${frame.type})`);
+  }
+});
+
+// Upstream contract: stdin close drains accepted commands, disposes the session
+// and exits with code 0.
+rl.on("close", () => {
+  log(`stdio closed; session ${state.sessionId} disposed after ${state.promptCount} prompt(s)`);
+  setTimeout(() => process.exit(0), 10);
+});
+
+process.on("SIGTERM", () => {
+  log("SIGTERM received; exiting");
+  process.exit(0);
+});

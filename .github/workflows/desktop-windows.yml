@@ -1,0 +1,154 @@
+name: Desktop · Windows artifacts
+
+# Manual trigger only. Dispatch it from the Actions tab (or `gh workflow run`)
+# and it produces the two Windows deliverables the desktop shell ships:
+#
+#   Oh-My-Pi-Desktop-Setup-<version>-x64.exe      NSIS installer
+#   Oh-My-Pi-Desktop-Portable-<version>-x64.exe   single-file executable
+#
+# plus the unpacked app directory, so a broken artifact can be inspected
+# without reinstalling anything.
+#
+# The bundled runtime is the real upstream release binary (`omp-windows-x64.exe`
+# from github.com/can1357/oh-my-pi/releases), verified against the release's
+# SHA256SUMS.txt before packaging. Set `omp_version` to pin a tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      omp_version:
+        description: "oh-my-pi release tag for the bundled omp runtime (e.g. v18.7.0, or 'latest')"
+        required: false
+        default: "latest"
+        type: string
+      release:
+        description: "Publish the artifacts as a GitHub Release in this repository"
+        required: false
+        default: false
+        type: boolean
+      smoke_test:
+        description: "Boot the packaged app on this runner and run its self-test"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Build Windows installer + portable exe
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    env:
+      # electron-builder must never publish on its own; releases are opt-in below.
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      OMP_RUNTIME_VERSION: ${{ inputs.omp_version }}
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Report the toolchain
+        shell: bash
+        run: |
+          bun --version
+          node --version
+          echo "runner: ${{ runner.os }} / ${{ runner.arch }}"
+
+      - name: Install dependencies
+        shell: bash
+        run: bun install --frozen-lockfile
+
+      - name: Build icons
+        shell: bash
+        run: bun run icons
+
+      - name: Fetch the upstream omp runtime for Windows
+        shell: bash
+        run: bun run desktop:runtime:win
+
+      - name: Typecheck
+        shell: bash
+        run: bun run typecheck
+
+      - name: Build the renderer bundle
+        shell: bash
+        run: bun run build
+
+      - name: Package the Windows artifacts
+        shell: bash
+        run: bun run desktop:dist:win
+
+      - name: List the artifacts
+        shell: bash
+        run: |
+          ls -la release
+          echo "--- installer/portable ---"
+          ls -la release/*.exe
+
+      - name: Self-test the packaged app
+        if: ${{ inputs.smoke_test }}
+        id: smoke
+        shell: bash
+        env:
+          OMP_DESKTOP_VERIFY: "1"
+          OMP_DESKTOP_VERIFY_OUT: ${{ github.workspace }}\verify-output
+          OMP_DESKTOP_VERIFY_TIMEOUT: "120000"
+          OMP_DESKTOP_VERBOSE: "1"
+        run: |
+          set -o pipefail
+          APP="release/win-unpacked/Oh My Pi Desktop.exe"
+          test -f "$APP" || { echo "packaged app missing at $APP"; ls -R release/win-unpacked | head -40; exit 1; }
+          "$APP" > smoke.log 2>&1 || true
+          echo "=== smoke log ==="
+          tail -60 smoke.log || true
+          echo "=== report ==="
+          cat verify-output/report.json || { echo "no verify report was written"; exit 1; }
+          node -e "const r=require('./verify-output/report.json'); console.log('ok:', r.ok, 'failures:', JSON.stringify(r.failures)); if(!r.ok) process.exit(1)"
+
+      - name: Upload the installer and portable exe
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: omp-desktop-windows-${{ github.run_number }}
+          path: |
+            release/*.exe
+            release/*.blockmap
+            release/latest.yml
+            verify-output/**
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload the unpacked app directory
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: omp-desktop-windows-unpacked-${{ github.run_number }}
+          path: release/win-unpacked/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Publish a GitHub Release
+        if: ${{ inputs.release }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="desktop-v$(node -p "require('./package.json').version")-build.${{ github.run_number }}"
+          gh release create "$tag" \
+            --title "Oh My Pi Desktop $tag" \
+            --notes "Windows build from workflow dispatch (run ${{ github.run_number }}). Bundled omp runtime: ${{ inputs.omp_version }}. Installer and portable executable attached." \
+            release/*.exe
+          echo "released $tag"
