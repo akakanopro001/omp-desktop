@@ -28,7 +28,6 @@
  *   OMP_DESKTOP_OMP_ROOT     explicit checkout root (source-root override)
  *   OMP_DESKTOP_WORKSPACE    sandbox root the fs/git bridge refuses to escape
  *   OMP_DESKTOP_MODE         gateway transport: rpc (default) | rpc-ui
- *   OMP_DESKTOP_GATEWAY_PORT HTTP /status port for the bundled payload (0 disables)
  *   OMP_DESKTOP_VERIFY       run the headless self-test and exit
  *   OMP_DESKTOP_VERIFY_OUT   directory for the self-test report + screenshots
  *   OMP_DESKTOP_VERBOSE      mirror the shell log to stdout
@@ -46,7 +45,6 @@ const OMP_HOME = process.env.OMP_HOME || path.join(os.homedir(), ".omp");
 const LOG_DIR = path.join(OMP_HOME, "logs");
 const LOG_FILE = path.join(LOG_DIR, "desktop.log");
 const DEV_URL = process.env.OMP_DESKTOP_DEV_URL || "";
-const GATEWAY_PORT = Number(process.env.OMP_DESKTOP_GATEWAY_PORT ?? 7878);
 const VERIFY = process.env.OMP_DESKTOP_VERIFY === "1";
 /**
  * In a packaged app the renderer and the bundled payload live inside the app
@@ -56,6 +54,10 @@ const VERIFY = process.env.OMP_DESKTOP_VERIFY === "1";
  */
 const APP_ROOT = app.isPackaged ? app.getAppPath() : path.join(__dirname, "..");
 const VERIFY_DIR = process.env.OMP_DESKTOP_VERIFY_OUT || path.join(APP_ROOT, "verify-output");
+// How long a freshly spawned runtime gets to print its `ready` frame. A runtime
+// that dies is detected by the exit race instead of by this budget, so a cold
+// start of the 236 MB release binary on a CI runner is not mistaken for a hang.
+const READY_TIMEOUT = Number(process.env.OMP_DESKTOP_READY_TIMEOUT ?? 45000);
 
 // The self-test must never read or write the real desktop profile: give it a
 // throwaway userData directory so first-run onboarding is exercised every time.
@@ -411,10 +413,9 @@ async function startGateway() {
   if (!runtime) return { ok: false, pid: null, handshake: null, damage: runtimeDamage };
   if (gateway) return { ok: true, pid: gateway.pid, handshake: gatewayState.handshake, damage: null };
 
+  // Only flags that exist upstream: `omp` validates them against its own table
+  // and exits 2 on anything unknown, so nothing is ever invented here.
   const args = [...runtime.args];
-  // The bundled payload also answers a plain HTTP /status probe the connection
-  // panel can point at; upstream omp has no such flag, so it never receives it.
-  if (runtime.kind === "bundled-payload" && GATEWAY_PORT > 0) args.push("--http", String(GATEWAY_PORT));
 
   gateway = spawn(runtime.command, args, {
     cwd: runtime.cwd,
@@ -430,35 +431,69 @@ async function startGateway() {
     windowsHide: true,
   });
 
-  transport = createTransport(gateway);
-  transport.onFrame((frame) => {
+  // Hold the child through a local reference: the exit handler nulls the module
+  // scope, and a runtime that dies mid-handshake must not become a TypeError.
+  const child = gateway;
+  const pipe = createTransport(child);
+  transport = pipe;
+  let exited = null;
+  pipe.onFrame((frame) => {
     if (frame.type === "response" && frame.success === false) log(`rpc <- ${frame.command} failed: ${frame.error}`);
     if (frame.type === "extension_error") log(`extension error in ${frame.extensionPath}: ${frame.error}`);
   });
-  gateway.stderr.on("data", (chunk) => log(`[omp:stderr] ${chunk.toString().trimEnd()}`));
-  gateway.on("error", (error) => log(`gateway spawn error: ${error.message}`));
-  gateway.on("exit", (code, signal) => {
+  let stderrText = "";
+  child.stderr.on("data", (chunk) => {
+    stderrText += chunk.toString();
+    log(`[omp:stderr] ${chunk.toString().trimEnd()}`);
+  });
+  child.on("error", (error) => log(`gateway spawn error: ${error.message}`));
+  child.on("exit", (code, signal) => {
+    exited = { code, signal };
     log(`omp runtime exited code=${code} signal=${signal}`);
-    gateway = null;
-    transport = null;
+    if (gateway === child) {
+      gateway = null;
+      transport = null;
+    }
   });
 
-  gatewayState = { started: true, pid: gateway.pid, handshake: null };
-  log(`gateway started: ${runtime.command} ${args.join(" ")} (pid ${gateway.pid})`);
+  gatewayState = { started: true, pid: child.pid, handshake: null };
+  log(`gateway started: ${runtime.command} ${args.join(" ")} (pid ${child.pid})`);
 
-  // 01 — the ready frame is the runtime's opening statement, not a reply.
-  const ready = await transport.awaitReady(20000);
-  if (!ready) {
-    gatewayState.handshake = { ok: false, error: "the runtime wrote no ready frame within 20s", mode: GATEWAY_MODE };
-    log(`gateway handshake FAILED: ${gatewayState.handshake.error}`);
-    return { ok: true, pid: gateway.pid, handshake: gatewayState.handshake };
+  // 01 — the ready frame is the runtime's opening statement, not a reply. A
+  // runtime that dies first (an unknown flag, no provider) is reported as an
+  // exit rather than being blamed on the handshake timeout 20s later.
+  const ready = exited
+    ? null
+    : await Promise.race([
+        pipe.awaitReady(READY_TIMEOUT),
+        new Promise((resolve) => child.once("exit", () => resolve(null))),
+      ]);  if (!ready) {
+    // The single most common non-interactive failure is not a broken runtime:
+    // upstream refuses to open a session with no model (`!isInteractive &&
+    // !session.model` in main.ts) and exits 1 with a message naming the fix.
+    // Report that as a distinct, actionable state instead of "unusable".
+    const reason = stderrText.trim().split("\n").find(Boolean) ?? null;
+    const needsModel = /no default model selected|no models available|no model available matching/i.test(stderrText);
+    gatewayState.handshake = {
+      ok: false,
+      mode: GATEWAY_MODE,
+      error: exited
+        ? `the runtime exited (code=${exited.code}) before the ready frame`
+        : `the runtime wrote no ready frame within ${Math.round(READY_TIMEOUT / 1000)}s`,
+      reason,
+      needsModel,
+      guidance: needsModel ? "omp will not open a session without a model — add a provider key in Settings → Providers." : null,
+      runtimeKind: runtime.kind,
+    };
+    log(`gateway handshake FAILED: ${gatewayState.handshake.error}${reason ? ` — ${reason}` : ""}`);
+    return { ok: false, pid: child.pid, handshake: gatewayState.handshake, damage: runtimeDamage };
   }
   const supported = ready.supportedProtocolVersions ?? [ready.protocolVersion ?? 1];
 
   // 02 — opt into the lossless chunked transport when the runtime offers v2.
   let protocolVersion = ready.protocolVersion ?? 1;
   if (supported.includes(2)) {
-    const negotiated = await transport.send({ id: "protocol-1", type: "negotiate_protocol", protocolVersion: 2 }, 8000);
+    const negotiated = await pipe.send({ id: "protocol-1", type: "negotiate_protocol", protocolVersion: 2 }, 8000);
     if (negotiated.ok) {
       protocolVersion = 2;
       log("protocol negotiated: v2 (rpc_chunk reassembly enabled)");
@@ -468,9 +503,16 @@ async function startGateway() {
   }
 
   // 03 — prove the session answers real commands, not just the greeting.
-  const state = await transport.send({ type: "get_state" }, 20000);
-  const commands = await transport.send({ type: "get_available_commands" }, 12000);
-  const models = await transport.send({ type: "get_available_models" }, 20000);
+  const state = await pipe.send({ type: "get_state" }, 20000);
+  const commands = await pipe.send({ type: "get_available_commands" }, 12000);
+  const models = await pipe.send({ type: "get_available_models" }, 20000);
+
+  // Upstream answers these two with an envelope (`{ commands: [...] }`,
+  // `{ models: [...] }`); older builds answered with a bare array. Accept both
+  // so the counts in the status bar match whichever runtime is resolved.
+  const readList = (value, key) => (Array.isArray(value) ? value : Array.isArray(value?.[key]) ? value[key] : []);
+  const modelList = readList(models.data, "models");
+  const commandList = readList(commands.data, "commands");
 
   gatewayState.handshake = {
     ok: state.ok,
@@ -493,23 +535,29 @@ async function startGateway() {
       debug: true,
       subagents: Array.isArray(state.data?.subagents) || state.ok,
       memory: state.ok,
-      todos: Boolean(state.data?.todos || state.ok),
-      models: Array.isArray(models.data) ? models.data.length : 0,
-      commands: Array.isArray(commands.data) ? commands.data.length : 0,
-      queue: state.data?.queue ?? null,
-      streaming: state.ok,
+      todos: Boolean(state.data?.todoPhases || state.data?.todos || state.ok),
+      models: modelList.length,
+      commands: commandList.length,
+      queue: state.data?.queuedMessages ?? state.data?.queue ?? null,
+      streaming: Boolean(state.data?.isStreaming !== undefined || state.ok),
     },
+    needsModel: false,
     session: state.data ?? null,
     error: state.ok ? undefined : state.error,
   };
 
   if (state.ok) {
-    log(`gateway handshake ok: omp ${runtime.version ?? "unknown"} over ${GATEWAY_MODE} v${protocolVersion} — ${gatewayState.handshake.capabilities.models} models, ${gatewayState.handshake.capabilities.commands} commands`);
+    log(`gateway handshake ok: omp ${runtime.version ?? "unknown"} over ${GATEWAY_MODE} v${protocolVersion} — ${modelList.length} models, ${commandList.length} commands`);
+    log(
+      `  session ${state.data?.sessionId ?? "?"} · model ` +
+        `${state.data?.model ? `${state.data.model.provider}/${state.data.model.id}` : "none selected"} · ` +
+        `todos ${Array.isArray(state.data?.todoPhases) ? state.data.todoPhases.length : 0}`,
+    );
   } else {
     log(`gateway handshake FAILED on get_state: ${state.error}`);
   }
 
-  return { ok: true, pid: gateway.pid, handshake: gatewayState.handshake };
+  return { ok: Boolean(state.ok), pid: child.pid, handshake: gatewayState.handshake, damage: null };
 }
 
 /**
@@ -554,11 +602,20 @@ function runtimeArgv(rest) {
   return runtime?.script ? [runtime.args[0], ...rest] : rest;
 }
 
-/** The four omp entry points, with the exact command this shell would use for each. */
+/**
+ * The four omp entry points. `supported` comes from what the resolved runtime's
+ * own `--help` advertises, and `live` says whether a session is answering right
+ * now — the two differ on purpose: with no provider configured the real binary
+ * still *has* an RPC entry point, it just exits 1 instead of serving one, and
+ * the UI must say that rather than call the runtime broken.
+ */
 async function entryPoints() {
   const binary = runtime ? (runtime.script ? `${runtime.command} ${runtime.args[0]}` : runtime.command) : null;
   const help = runtime ? await run(runtime.command, runtimeArgv(["--help"])) : { ok: false, stdout: "" };
   const helpText = help.stdout || "";
+  const live = Boolean(gatewayState.handshake?.ok);
+  const liveReason = live ? null : gatewayState.handshake?.error ?? (runtime ? "no session has been started" : "no runtime resolved");
+  const advertises = (pattern) => new RegExp(pattern, "i").test(helpText);
   return [
     {
       id: "interactive",
@@ -566,27 +623,35 @@ async function entryPoints() {
       command: binary ? `${binary}` : "omp",
       detail: "Full-screen session — the agent you talk to in a terminal.",
       supported: Boolean(runtime),
+      live: Boolean(runtime),
+      liveReason: runtime ? null : liveReason,
     },
     {
       id: "oneshot",
       name: "One-shot print",
       command: "omp -p \"<prompt>\" --mode text",
       detail: "Runs the prompt non-interactively and exits — wired to the shell's Run request.",
-      supported: Boolean(runtime) && (helpText.includes("--print") || helpText.includes("-p,") || help.ok),
+      supported: Boolean(runtime) && (advertises("--print") || advertises("-p,")),
+      live,
+      liveReason,
     },
     {
       id: "rpc",
       name: "RPC over stdio",
       command: `omp --mode ${GATEWAY_MODE}${GATEWAY_MODE === "rpc" ? " --no-ui" : ""}`,
       detail: "Line-delimited JSON commands, responses and events — the transport this shell speaks.",
-      supported: Boolean(gatewayState.handshake?.ok),
+      supported: Boolean(runtime) && advertises("--mode[= ]rpc"),
+      live,
+      liveReason,
     },
     {
       id: "acp",
       name: "ACP",
       command: "omp acp  ·  omp --mode acp",
       detail: "Agent Client Protocol server over stdio, for Zed and other ACP hosts.",
-      supported: Boolean(runtime) && (helpText.includes("acp") || help.ok),
+      supported: Boolean(runtime) && advertises("\\bacp\\b"),
+      live,
+      liveReason,
     },
   ];
 }
@@ -684,7 +749,8 @@ function registerIpc() {
     script: Boolean(runtime?.script),
     transport: transport ? transport.stats() : null,
     platform: `${process.platform}/${process.arch}`,
-    gatewayPort: runtime?.kind === "bundled-payload" && GATEWAY_PORT > 0 ? GATEWAY_PORT : null,
+    // omp speaks JSON over stdio and opens no port, so there is never one here.
+    gatewayPort: null,
     logFile: LOG_FILE,
     home: OMP_HOME,
   }));
@@ -887,7 +953,9 @@ async function runVerify(win) {
     report.gateway = { started: gatewayState.started, pid: gatewayState.pid, alive: Boolean(gateway && !gateway.killed) };
 
     if (!runtime) report.failures.push("no runnable runtime was resolved");
-    if (!gatewayState.handshake?.ok) report.failures.push("gateway handshake failed");
+    // A runtime that resolved but has no model to run is not a broken handshake;
+    // it is reported as `runtimeUnconfigured` below with omp's own guidance.
+    if (!gatewayState.handshake?.ok && !gatewayState.handshake?.needsModel) report.failures.push("gateway handshake failed");
 
     // Desktop route: wait for React, dismiss onboarding, then assert the shell landed.
     const mounted = await waitFor(win, "Boolean(document.getElementById('root')?.children.length)");
@@ -938,10 +1006,27 @@ async function runVerify(win) {
     if (!report.dom.landing.h1) report.failures.push("landing did not render");
     report.screenshots.push(await shot(win, "landing.png"));
 
-    // HTTP /status sweep — the same probe Settings → Connections runs for a remote gateway.
-    if (GATEWAY_PORT > 0) {
-      report.gatewayProbe = await probeGateway({ url: `http://127.0.0.1:${GATEWAY_PORT}` });
-      if (!report.gatewayProbe.rpc) report.failures.push(`gateway /status probe failed on port ${GATEWAY_PORT}`);
+    // A runtime with no provider configured never opens a session (upstream
+    // requires a model in non-interactive modes), so the session-dependent
+    // assertions below are skipped and stated instead of blamed on the shell.
+    const handshake = gatewayState.handshake;
+    report.runtimeUnconfigured = Boolean(handshake?.needsModel);
+    report.notes = [];
+    if (report.runtimeUnconfigured) {
+      report.notes.push(
+        `omp refused to open a session — ${handshake.reason ?? handshake.error} ` +
+          "Entry points are still classified from `omp --help`; the RPC session assertions were skipped.",
+      );
+      log(`verify note: ${report.notes[report.notes.length - 1]}`);
+    }
+
+    // The transport is the gateway: stdio JSON lines, no port. Assert the
+    // handshake actually carried real frames instead of probing a server omp
+    // never opens.
+    report.transport = transport ? transport.stats() : null;
+    if (!report.runtimeUnconfigured) {
+      if (!report.transport) report.failures.push("no omp transport is attached");
+      else if (!report.transport.frames) report.failures.push("the omp transport received no frames");
     }
 
     // IPC round trip through the preload bridge, exactly as the renderer does it.
@@ -949,14 +1034,27 @@ async function runVerify(win) {
     if (!report.dom.ipc) report.failures.push("preload bridge missing window.ompNative");
     const ipcRuntime = await win.webContents.executeJavaScript("window.ompNative.runtime.state()").catch((error) => ({ error: String(error) }));
     report.runtimeFromRenderer = ipcRuntime;
-    if (!ipcRuntime?.handshake?.ok) report.failures.push("renderer could not see a handshaken runtime");
+    if (!ipcRuntime?.handshake?.ok && !report.runtimeUnconfigured) report.failures.push("renderer could not see a handshaken runtime");
 
-    // The other three entry points, exercised for real: `omp --help` classifies
-    // them and one-shot actually drives `omp -p "…" --mode text` to completion.
+    // The four entry points: `omp --help` classifies them, and the one-shot one
+    // is actually driven to completion with `omp -p "…" --mode text`.
     report.entryPoints = await entryPoints();
-    if (!report.entryPoints.find((entry) => entry.id === "rpc")?.supported) report.failures.push("RPC entry point is not reachable");
-    report.oneShot = await runOneShot({ prompt: "List the entry points this runtime exposes.", timeoutMs: 60000 });
-    if (!report.oneShot.ok) report.failures.push(`one-shot entry point failed: ${report.oneShot.error ?? report.oneShot.code}`);
+    const unsupported = report.entryPoints.filter((entry) => !entry.supported).map((entry) => entry.id);
+    if (unsupported.length) report.failures.push(`entry points the resolved runtime does not advertise: ${unsupported.join(", ")}`);
+    report.oneShot = await runOneShot({ prompt: "List the entry points this runtime exposes.", timeoutMs: 90000 });
+    if (!report.oneShot.ok) {
+      // A real omp with no provider credentials still exits non-zero *after* the
+      // entry point ran, which is what this assertion is about. Record that as a
+      // note; a runtime that could not be spawned or driven stays a failure.
+      const transcript = `${report.oneShot.stdout ?? ""}\n${report.oneShot.stderr ?? ""}`;
+      const noCredentials = report.oneShot.code !== undefined && /api[- ]?key|credential|unauthor|not logged in|no provider|authentication/i.test(transcript);
+      if (noCredentials) {
+        report.oneShot.note = "the runtime ran but this environment has no provider credentials";
+        log(`one-shot note: ${report.oneShot.note}`);
+      } else {
+        report.failures.push(`one-shot entry point failed: ${report.oneShot.error ?? report.oneShot.code}`);
+      }
+    }
 
     report.ok = report.failures.length === 0;
   } catch (error) {

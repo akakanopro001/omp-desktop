@@ -38,7 +38,7 @@ Only the packaged shell reads these; the browser runtime needs none of them.
 | `OMP_DESKTOP_OMP_ROOT` | explicit checkout root (source-root override) |
 | `OMP_DESKTOP_WORKSPACE` | sandbox root the shell's filesystem/git bridge refuses to escape |
 | `OMP_DESKTOP_MODE` | gateway transport: `rpc` (default) or `rpc-ui` |
-| `OMP_DESKTOP_GATEWAY_PORT` | `/status` port for the bundled payload (0 disables; upstream runtimes never receive it) |
+| `OMP_DESKTOP_READY_TIMEOUT` | how long a spawned runtime gets to print its `ready` frame in ms (default 45000) |
 | `OMP_DESKTOP_VERIFY_OUT` | directory for the self-test report, screenshots and log |
 | `OMP_DESKTOP_VERIFY_TIMEOUT` | watchdog budget for the self-test in ms (default 75000) |
 | `OMP_DESKTOP_VERBOSE` | mirror the shell log to stdout |
@@ -76,7 +76,7 @@ The self-test boots the real shell against a throwaway profile, so first-run onb
 4. the renderer mounts `/app`, the onboarding overlay is present at load and completes, and the shell shows its title bar, rail tabs and composer,
 5. the landing route renders through the same packaged window,
 6. the preload bridge is reachable from the renderer and can read the live runtime state (pid, handshake, capabilities),
-7. an HTTP `/status` sweep of the spawned payload matches the connection probe in Settings → Connections.
+7. the stdio transport carried real frames (no port is probed, because omp opens none — the transport *is* the gateway), and `report.transport` records the frame/chunk/event counts.
 
 Artifacts land in `verify-output/`: `report.json` (every probe above), `desktop.png` and `landing.png` (full-window captures), and `desktop.log` (the shell log, also appended to `~/.omp/logs/desktop.log`). The command exits non-zero and writes the failure list if any step fails, and a watchdog reports a hang instead of blocking forever.
 
@@ -99,7 +99,7 @@ Running as root (or in CI containers) also needs `--no-sandbox`, which `desktop:
 * `omp --mode rpc [--no-ui]` — the real transport: a `ready` frame advertising protocol v1/v2, `{ type: "response", command, success, data }` replies, `negotiate_protocol` to v2, `get_state` / `get_available_commands` / `get_available_models` / `get_available_thinking_levels` / `prompt` / `abort` / `new_session` / `set_model` / `set_todos` / `set_subagent_subscription` / subagent commands, streamed `agent_start` / `message_update` / `message_end` / `agent_end`, a `prompt_result` completion frame and `session_settled`,
 * `omp --mode acp` — the ACP entry point,
 * stdin-close shutdown that drains the session and exits 0, exactly as upstream documents,
-* an optional HTTP `/status` gateway for the connection panel (the bundled payload only; upstream `omp` has no such flag and never receives it).
+* the same flag validation as the real CLI: anything outside `flag-tables.ts` exits 2 with `Error: unknown flag: --x`, so a shell that passes a flag `omp` never had fails locally instead of only on a packaged build.
 
 Swap in the real binary and nothing else changes — the shell already speaks its protocol.
 
@@ -129,6 +129,8 @@ Each candidate is probed before use, and a damaged bundled payload is **reported
 6. managed install (`~/.omp/agent/bin`)
 
 Then capabilities are read straight from the session (`get_state`, `get_available_commands`, `get_available_models` — no websocket server is claimed, because omp's transport is stdio JSON lines) and the workspace is indexed. First run adds onboarding: pick a provider + model, a turn mode, and a default project folder.
+
+A runtime that resolves but has no model is reported as **unconfigured**, not broken: upstream refuses to open a session without one (`!isInteractive && !session.model` in `main.ts`) and exits 1 with `No default model selected…`, so the shell surfaces that message verbatim plus its own pointer to Settings → Providers, and the self-test records `runtimeUnconfigured` with the guidance instead of failing.
 
 ### State ownership
 
@@ -252,7 +254,7 @@ They are produced by **`.github/workflows/desktop-windows.yml`**, a manual workf
 
 1. fetches `omp-windows-x64.exe` from [`can1357/oh-my-pi` releases](https://github.com/can1357/oh-my-pi/releases) into `resources/omp-runtime/bin/`, verifying it against the release's `SHA256SUMS.txt` (`node scripts/fetch-omp-runtime.mjs win32-x64`),
 2. typechecks, builds the renderer bundle, and packages both Windows targets,
-3. boots the packaged app on the runner and runs the same self-test described below,
+3. boots the packaged app on the runner and runs the same self-test described below, with a placeholder `ANTHROPIC_API_KEY` so the real `omp.exe` opens a session and the handshake is exercised for real,
 4. uploads the installers, the blockmap, and the unpacked app directory, and can publish a GitHub Release when the `release` input is ticked.
 
 Run it from the Actions tab or:

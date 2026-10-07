@@ -6,8 +6,8 @@
  * target platform (`omp-windows-x64.exe`, `omp-linux-x64`, `omp-darwin-arm64`, …)
  * downloaded from https://github.com/can1357/oh-my-pi/releases. When no release
  * binary is present this stub stands in, so the shell's runtime resolver, its
- * omp RPC transport, the one-shot entry point and the /status probe can all be
- * verified end to end without a provider key or a model call.
+ * omp RPC transport and the one-shot entry point can all be verified end to end
+ * without a provider key or a model call.
  *
  * It implements the upstream surface, not an invention of its own:
  *
@@ -16,7 +16,6 @@
  *   omp -p "<prompt>" --mode text                  one-shot, non-interactive
  *   omp -p --mode json                             one-shot, JSON event stream
  *   omp --mode rpc [--no-ui]                       JSONL commands/responses/events
- *   omp --mode rpc --http N                        the same, plus an HTTP /status
  *   omp --mode acp                                 prints the ACP handshake line
  *
  * Transport contract (docs/rpc.md upstream): stdout is one JSON object per line,
@@ -24,13 +23,16 @@
  * optional `id` that responses echo, and closing stdin drains the session and
  * exits 0.
  *
+ * Flags are validated against the same table the real CLI uses
+ * (`packages/coding-agent/src/cli/flag-tables.ts`) and anything unknown exits 2
+ * with `Error: unknown flag`, so a shell that passes a flag omp never had fails
+ * here instead of only on a packaged build.
+ *
  * Env:
  *   OMP_HOME       user-data home (the stub logs under $OMP_HOME/logs)
- *   OMP_STUB_HTTP  port for the optional HTTP gateway (0 disables it)
  */
 
 const readline = require("node:readline");
-const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -48,6 +50,57 @@ const valueOf = (flag) => {
   const value = argv[index + 1];
   return value && !value.startsWith("-") ? value : undefined;
 };
+// The flag table of the real CLI, read out of its own `--help` (the FLAGS
+// section, plus `-h/--help` and `-v/--version` which args.ts accepts off-table).
+// The real binary rejects anything else with `Error: unknown flag: --x` and exit
+// 2, and so does this payload: a stub with a permissive parser happily confirms a
+// shell that passes a flag omp never had — the exact failure this check exists to
+// prevent, and one that otherwise only shows up on a packaged build.
+// Accepted flags are the union of the CLI's own table (which keeps a few flags
+// out of `--help`: `--yolo`, `--fork`, `--session`, `--trusted-extension`, …) and
+// everything the help renders. Both were read off the released 18.7.0 binary.
+const KNOWN_FLAGS = new Set([
+  "--add-dir", "--advisor", "--alias", "--allow-home", "--api-key", "--append-system-prompt", "--approval-mode",
+  "--auto-approve", "--config", "--continue", "--cwd", "--export", "--extension", "--external-thinking", "--fork",
+  "--from-claude", "--from-codex", "--goal", "--help", "--hide-thinking", "--hook", "--max-time", "--mode", "--model",
+  "--models", "--no-extensions", "--no-lsp", "--no-prewalk", "--no-pty", "--no-rules", "--no-session", "--no-skills",
+  "--no-title", "--no-tools", "--no-ui", "--omp-profile-boundary", "--plan", "--plan-yolo", "--plan-yolo-into",
+  "--plugin-dir", "--prewalk", "--prewalk-into", "--print", "--print-thoughts", "--profile", "--prompt-cache-key",
+  "--provider", "--provider-session-id", "--resume", "--service-tier", "--session", "--session-dir", "--skills", "--slow",
+  "--smol", "--system-prompt", "--system-prompt-template", "--thinking", "--tools", "--trusted-extension", "--version",
+  "--yolo",
+  "-c", "-e", "-h", "-p", "-r", "-v",
+]);
+
+// Flags that consume a value, so one is never mistaken for an unknown flag.
+const VALUE_FLAGS = new Set([
+  "--add-dir", "--advisor", "--alias", "--api-key", "--append-system-prompt", "--approval-mode", "--config", "--cwd",
+  "--export", "--extension", "--goal", "--hook", "--max-time", "--mode", "--model", "--models", "--plan",
+  "--plan-yolo-into", "--plugin-dir", "--prewalk-into", "--profile", "--prompt-cache-key", "--provider",
+  "--provider-session-id", "--resume", "--service-tier", "--session", "--session-dir", "--skills", "--slow", "--smol",
+  "--system-prompt", "--system-prompt-template", "--thinking", "--tools", "--trusted-extension", "-e", "-r",
+]);
+
+const unknownFlags = [];
+for (let index = 0; index < argv.length; index += 1) {
+  const arg = argv[index];
+  if (!arg.startsWith("-") || arg === "-" || arg === "--") continue;
+  // `--flag=value` splits before the table lookup, exactly as the real parser
+  // does — and only for long flags: `-e=x` is rejected upstream.
+  const equals = arg.startsWith("--") ? arg.indexOf("=") : -1;
+  const name = equals === -1 ? arg : arg.slice(0, equals);
+  if (KNOWN_FLAGS.has(name)) {
+    if (equals === -1 && VALUE_FLAGS.has(name)) index += 1;
+    continue;
+  }
+  unknownFlags.push(arg);
+}
+if (unknownFlags.length) {
+  process.stderr.write(`Error: unknown flag${unknownFlags.length === 1 ? "" : "s"}: ${unknownFlags.join(", ")}\n`);
+  process.stderr.write("Run `omp --help` for available flags.\n");
+  process.exit(2);
+}
+
 const OMP_HOME = process.env.OMP_HOME || path.join(process.env.HOME || process.cwd(), ".omp");
 
 function log(line) {
@@ -81,7 +134,6 @@ Options
   --print-thoughts    include thinking blocks in printed output
   --model <selector>  model for the default role
   --no-ui             run extensions headless under rpc/rpc-ui
-  --http <port>       this payload's /status gateway (desktop convenience)
   -v, --version       print the version
   -h, --help          print this help
 
@@ -177,42 +229,6 @@ function send(frame) {
   process.stdout.write(`${JSON.stringify(frame)}\n`);
 }
 
-function startHttpGateway(port) {
-  if (!port) return;
-  const server = http.createServer((request, response) => {
-    if (request.url === "/status" || request.url === "/health") {
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(
-        JSON.stringify({
-          server: SERVER_NAME,
-          version: VERSION,
-          transport: "rpc",
-          protocolVersion: 2,
-          auth: "none",
-          websocket: false,
-          rpc: true,
-          sessions: true,
-          fileBrowser: true,
-          lsp: true,
-          debug: true,
-          subagents: true,
-          memory: true,
-          tools: TOOLS.length,
-          commands: COMMANDS.length,
-        }),
-      );
-      return;
-    }
-    response.writeHead(404, { "content-type": "application/json" });
-    response.end(JSON.stringify({ error: "not found" }));
-  });
-  server.listen(port, "127.0.0.1", () => {
-    const address = server.address();
-    log(`http gateway listening on 127.0.0.1:${typeof address === "object" && address ? address.port : port}`);
-  });
-  server.on("error", (error) => log(`http gateway error: ${error.message}`));
-}
-
 /** One-shot and json modes share one body of work; only the framing differs. */
 function runPrint(prompt) {
   const summary = {
@@ -287,7 +303,6 @@ const state = {
 };
 
 log(`rpc gateway started (stdio, mode=${mode}) home=${OMP_HOME} pid=${process.pid}`);
-startHttpGateway(Number(valueOf("--http") ?? process.env.OMP_STUB_HTTP ?? 0));
 
 // The ready frame comes first, before any command is read.
 send({

@@ -146,13 +146,24 @@ jobs:
       - name: Self-test the packaged app
         if: ${{ inputs.smoke_test || github.event_name == 'push' }}
         id: smoke
-        timeout-minutes: 6
+        timeout-minutes: 8
         shell: bash
         env:
           OMP_DESKTOP_VERIFY: "1"
           OMP_DESKTOP_VERIFY_OUT: ${{ github.workspace }}\verify-output
-          OMP_DESKTOP_VERIFY_TIMEOUT: "120000"
+          # The real 236 MB release binary starts cold on a fresh runner, so the
+          # handshake and the whole self-test get generous budgets. A runtime that
+          # dies is caught by the exit race, not by these numbers.
+          OMP_DESKTOP_READY_TIMEOUT: "60000"
+          OMP_DESKTOP_VERIFY_TIMEOUT: "300000"
           OMP_DESKTOP_VERBOSE: "1"
+          # omp refuses to open a session with no model configured, and a runner
+          # has no real credentials. This placeholder satisfies that startup gate
+          # so the smoke test drives what it is meant to drive: the bundled
+          # `omp.exe` resolving, its `ready` frame, protocol v2 negotiation and the
+          # real command surface. No provider call is expected to succeed — the
+          # one-off prompt records that as a note instead of a failure.
+          ANTHROPIC_API_KEY: "ci-placeholder-not-a-real-key"
         run: |
           set -o pipefail
           APP="release/win-unpacked/Oh My Pi Desktop.exe"
@@ -165,7 +176,7 @@ jobs:
           rm -f verify-output/report.json
           "$APP" --disable-gpu --no-sandbox > smoke.log 2>&1 &
           APP_PID=$!
-          for _ in $(seq 1 36); do
+          for _ in $(seq 1 60); do
             [ -f verify-output/report.json ] && break
             sleep 5
           done
