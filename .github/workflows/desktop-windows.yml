@@ -198,6 +198,53 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      # The unpacked directory above is the *build output*; this is the artifact a
+      # user actually double-clicks. The portable target is a self-extracting
+      # wrapper around the same app, so it gets the same treatment: launch it, wait
+      # for its report, and assert the bundled omp.exe handshakes from inside the
+      # extraction directory rather than from the build tree.
+      - name: Self-test the portable executable
+        if: ${{ inputs.smoke_test || github.event_name == 'push' }}
+        timeout-minutes: 8
+        shell: bash
+        env:
+          OMP_DESKTOP_VERIFY: "1"
+          OMP_DESKTOP_VERIFY_OUT: ${{ github.workspace }}\portable-verify
+          OMP_DESKTOP_READY_TIMEOUT: "60000"
+          OMP_DESKTOP_VERIFY_TIMEOUT: "300000"
+          OMP_DESKTOP_VERBOSE: "1"
+          ANTHROPIC_API_KEY: "ci-placeholder-not-a-real-key"
+        run: |
+          set -o pipefail
+          EXE=$(ls release/Oh-My-Pi-Desktop-Portable-*.exe | head -1)
+          test -f "$EXE" || { echo "no portable executable was produced"; ls release | head -20; exit 1; }
+          echo "portable artifact: $EXE ($(du -h "$EXE" | cut -f1))"
+
+          rm -f portable-verify/report.json
+          "$EXE" --no-sandbox --disable-gpu > portable.log 2>&1 &
+          APP_PID=$!
+          for _ in $(seq 1 60); do
+            [ -f portable-verify/report.json ] && break
+            sleep 5
+          done
+          cmd //c "taskkill /F /T /PID $APP_PID" >/dev/null 2>&1 || kill -9 "$APP_PID" 2>/dev/null || true
+          sleep 2
+
+          echo "=== portable log ==="
+          tail -40 portable.log || true
+          echo "=== portable report ==="
+          cat portable-verify/report.json || { echo "the portable executable wrote no verify report within the wait window"; exit 1; }
+          node -e "const r=require('./portable-verify/report.json'); console.log('portable ok:', r.ok, '| bundled runtime:', r.runtime?.kind, r.runtime?.version, '| protocol:', r.handshake?.serverInfo?.protocolVersion, '| failures:', JSON.stringify(r.failures)); if(!r.ok) process.exit(1)"
+
+      - name: Upload the portable self-test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: omp-desktop-windows-portable-selftest-${{ github.run_number }}
+          path: portable-verify/**
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Publish a GitHub Release
         if: ${{ inputs.release }}
         shell: bash
