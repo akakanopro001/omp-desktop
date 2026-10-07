@@ -254,8 +254,10 @@ They are produced by **`.github/workflows/desktop-windows.yml`**, a manual workf
 
 1. fetches `omp-windows-x64.exe` from [`can1357/oh-my-pi` releases](https://github.com/can1357/oh-my-pi/releases) into `resources/omp-runtime/bin/`, verifying it against the release's `SHA256SUMS.txt` (`node scripts/fetch-omp-runtime.mjs win32-x64`),
 2. typechecks, builds the renderer bundle, and packages both Windows targets,
-3. boots the packaged app on the runner and runs the same self-test described below, with a placeholder `ANTHROPIC_API_KEY` so the real `omp.exe` opens a session and the handshake is exercised for real,
-4. uploads the installers, the blockmap, and the unpacked app directory, and can publish a GitHub Release when the `release` input is ticked.
+3. uploads the installers, the blockmap and the unpacked app directory — before any GUI runs, so a smoke-test failure can never cost you the artifacts,
+4. boots `release/win-unpacked` and runs the self-test described below, with a placeholder `ANTHROPIC_API_KEY` so the real `omp.exe` opens a session and the handshake is exercised for real,
+5. launches **the portable executable itself** and runs it again from its extraction directory, because the unpacked folder is build output rather than the file a user double-clicks,
+6. can publish a GitHub Release when the `release` input is ticked.
 
 Run it from the Actions tab or:
 
